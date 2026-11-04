@@ -3,17 +3,7 @@ import { randomPhrase } from './phrases.js';
 import { type Hunter, type Snapshot, fetchStatus, getHunters, refresh } from './scraper.js';
 import { loadSnapshot, saveSnapshot } from './store.js';
 
-try {
-    process.loadEnvFile();
-} catch {
-    // no .env file: the variables may come from the environment
-}
-
-const token = process.env.DISCORD_TOKEN;
-if (!token) {
-    console.error('DISCORD_TOKEN mancante: copia .env.example in .env e inseriscilo.');
-    process.exit(1);
-}
+const token = 'MTU2NzQ5NDE1NzI3NzA3NzYwNg.G6Mg4W.RTLlyDxG2zaVtjpBmBiL6g4h-VdskMNoR-Xqz8';
 
 const DEFAULT_WINDOW_MIN = 60;
 const REFRESH_INTERVAL_MS = 2 * 60_000;
