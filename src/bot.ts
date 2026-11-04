@@ -11,6 +11,18 @@ try {
 }
 
 const token = process.env.DISCORD_TOKEN;
+// TEMP diagnostics: names and lengths only, never the values.
+console.log(
+    'DIAG env DISCORD*:',
+    Object.keys(process.env)
+        .filter(k => k.toUpperCase().includes('DISCORD'))
+        .map(k => `${JSON.stringify(k)}=${process.env[k]?.length ?? 0} car.`)
+        .join(', ') || 'nessuna',
+    '| RAILWAY_ENVIRONMENT_NAME:',
+    process.env.RAILWAY_ENVIRONMENT_NAME ?? 'n/d',
+    '| RAILWAY_SERVICE_NAME:',
+    process.env.RAILWAY_SERVICE_NAME ?? 'n/d',
+);
 if (!token) {
     console.error('DISCORD_TOKEN mancante: copia .env.example in .env e inseriscilo.');
     process.exit(1);
