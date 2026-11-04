@@ -7,12 +7,15 @@
         "start": "tsx src/bot.ts",
         "typecheck": "tsc --noEmit"
     },
+    "engines": {
+        "node": ">=22"
+    },
     "dependencies": {
-        "discord.js": "^14.28.1"
+        "discord.js": "^14.28.1",
+        "tsx": "^4.23.15"
     },
     "devDependencies": {
         "@types/node": "^26.6.6",
-        "tsx": "^4.23.15",
         "typescript": "^7.0.2"
     }
 }
