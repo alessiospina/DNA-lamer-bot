@@ -4,7 +4,8 @@ import { type Hunter, type Snapshot, fetchStatus, getHunters, refresh } from './
 import { loadSnapshot, saveSnapshot } from './store.js';
 
 try {
-    process.loadEnvFile();
+    // Relative to this file, not to the cwd: IDEs often start the script from the workspace root.
+    process.loadEnvFile(new URL('../.env', import.meta.url));
 } catch {
     // no .env file: the variables may come from the environment
 }
