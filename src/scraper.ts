@@ -15,6 +15,8 @@ const DEFAULT_RATE_LIMIT_PAUSE_MS = 30_000;
 /** A profile whose PX did not move is reopened anyway after this long, at most STALE_PER_CYCLE per refresh (safety net for kills that give no PX). */
 const STALE_MS = 20 * 60_000;
 const STALE_PER_CYCLE = 4;
+const PROFILE_LAG_RETRY_MS = 5 * 60_000;
+const PROFILE_WORK_BUDGET_MS = 90_000;
 export const DEFAULT_WINDOW_MINUTES = 15;
 export const MAX_WINDOW_MINUTES = 60;
 
@@ -35,7 +37,7 @@ interface Kind {
 }
 
 interface ProfileResponse {
-    character: { name: string; race: string; class: string; level: number };
+    character: { name: string; race: string; class: string; level: number; experience?: string | number };
     kinds: Kind[];
     capturedAt: string | null;
 }
@@ -50,15 +52,26 @@ export interface Hunter {
     lastMob: string;
 }
 
+export interface XpActivity {
+    serial: number;
+    name: string;
+    value: number;
+    observedAt: number;
+    awaitingProfile: boolean;
+    retryAt?: number;
+}
+
 /** The ranking baseline and, when available, the latest kill within the supported window. */
 export interface Tracked {
     serial: number;
     /** PX shown by the ranking when the profile was read: a different value means the player did something. */
     xp: number;
+    rankingXp?: number;
     fetchedAt: number;
     /** Last profile attempt, including failures. Older snapshots fall back to fetchedAt. */
     attemptedAt?: number;
     hunter: Hunter | null;
+    xpActivity?: XpActivity;
 }
 
 export interface Snapshot {
@@ -73,6 +86,7 @@ interface RefreshResult {
     read: number;
     unavailable: number;
     failed: number;
+    lagging: number;
     deferred: number;
     recentKills: number;
     olderKills: number;
@@ -208,9 +222,19 @@ export function getHunters(snapshot: Snapshot): Hunter[] {
  * One request reads the "Progressione" ranking, which carries every player's PX. Only the profiles of players whose PX changed (plus a few of
  * the oldest ones) are reopened; the first run, without a previous snapshot, opens all of them.
  */
-export async function refresh(prev: Snapshot | null, onProgress?: (done: number, total: number) => void): Promise<RefreshResult> {
-    const updatedAt = new Date();
-    const rankings = await getJson<{ boards: { id: string; entries: RankingEntry[] }[] }>('/rankings');
+interface RefreshOptions {
+    resetBaseline?: boolean;
+    onProgress?: (done: number, total: number) => void;
+    onRanking?: (snapshot: Snapshot) => void;
+    isAwake?: () => boolean;
+}
+
+export async function refresh(prev: Snapshot | null, options: RefreshOptions = {}): Promise<RefreshResult> {
+    const profileDeadline = Date.now() + PROFILE_WORK_BUDGET_MS;
+    const canReadProfile = () => Date.now() < profileDeadline && (options.isAwake?.() ?? true) && !isDnaCoolingDown();
+    const rankings = await getJson<{ boards: { id: string; entries: RankingEntry[] }[] }>(
+        '/rankings', { attempts: 2, timeoutMs: 5_000 },
+    );
     const board = rankings.ok ? rankings.data.boards.find(b => b.id === 'livello') : undefined;
     if (!board) {
         if (!rankings.ok && rankings.reason === 'rateLimited') throw new Error('Classifica Progressione rimandata per limite richieste');
@@ -226,42 +250,63 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
     const known = new Map((prev?.tracked ?? []).map(t => [t.serial, t]));
     const now = Date.now();
 
+    const pending: typeof entries = [];
     const changed: typeof entries = [];
     const stale: typeof entries = [];
     for (const e of entries) {
-        const p = known.get(e.serial);
-        if (!p) known.set(e.serial, { serial: e.serial, xp: -1, fetchedAt: 0, hunter: null });
-        if (!p || p.xp !== e.xp) changed.push(e);
+        const p = known.get(e.serial) ?? { serial: e.serial, xp: -1, fetchedAt: 0, hunter: null };
+        const previousXp = p.rankingXp;
+        let activity = options.resetBaseline ? undefined : p.xpActivity;
+        if (!options.resetBaseline && e.xp >= 0 && previousXp !== undefined && previousXp !== e.xp) {
+            activity = {
+                serial: e.serial, name: e.name, value: e.xp, observedAt: now,
+                awaitingProfile: true, retryAt: activity?.retryAt,
+            };
+        }
+        const withinWindow = activity !== undefined && now - activity.observedAt <= MAX_WINDOW_MINUTES * 60_000;
+        if (activity && !withinWindow && !activity.awaitingProfile) activity = undefined;
+        const rankingXp = e.xp >= 0 ? e.xp : options.resetBaseline ? undefined : previousXp;
+        known.set(e.serial, { ...p, rankingXp, xpActivity: activity });
+        if (activity?.awaitingProfile && e.xp >= 0) {
+            if (now >= (activity.retryAt ?? 0)) {
+                const queue = withinWindow ? pending : stale;
+                queue.push(e);
+            }
+        } else if (p.xp !== e.xp) changed.push(e);
         else if (now - p.fetchedAt > STALE_MS) stale.push(e);
     }
+    options.onRanking?.({ updatedAt: new Date(now), tracked: entries.map(e => known.get(e.serial)!), fetched: 0 });
     const lastAttempt = (serial: number) => {
         const player = known.get(serial)!;
         return player.attemptedAt ?? player.fetchedAt;
     };
+    pending.sort((a, b) => lastAttempt(a.serial) - lastAttempt(b.serial));
     changed.sort((a, b) => lastAttempt(a.serial) - lastAttempt(b.serial));
     stale.sort((a, b) => lastAttempt(a.serial) - lastAttempt(b.serial));
-    const toFetch = [...changed, ...stale.slice(0, STALE_PER_CYCLE)];
+    const toFetch = options.resetBaseline ? [] : [...pending, ...changed, ...stale.slice(0, STALE_PER_CYCLE)];
 
     let done = 0;
     let read = 0;
     let unavailable = 0;
     let failed = 0;
+    let lagging = 0;
     const readKillTimes: number[] = [];
     let renewedSession = false;
     const readProfile = (serial: number, cookie: string) => getJson<ProfileResponse>(
         `/profile/${serial}`, { attempts: PROFILE_ATTEMPTS, timeoutMs: PROFILE_TIMEOUT_MS, cookie },
     );
     for (const e of toFetch) {
-        if (isDnaCoolingDown()) break;
+        if (!canReadProfile()) break;
         sessionCookie ??= await login();
-        if (!sessionCookie) break;
+        if (!sessionCookie || !canReadProfile()) break;
         let res = await readProfile(e.serial, sessionCookie);
         if (!res.ok && res.reason === 'session' && !renewedSession) {
             renewedSession = true;
             sessionCookie = undefined;
             await sleep(PACE_MS);
+            if (!canReadProfile()) break;
             sessionCookie = await login();
-            if (!sessionCookie) break;
+            if (!sessionCookie || !canReadProfile()) break;
             res = await readProfile(e.serial, sessionCookie);
         }
         if (!res.ok && res.reason === 'session') {
@@ -269,18 +314,40 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
             throw new Error('Sessione DNA Shard rifiutata dopo il rinnovo');
         }
         const attemptedAt = Date.now();
-        if (res.ok || res.reason === 'gone') {
-            const hunter = res.ok ? buildHunter(e.serial, res.data) : null;
-            if (res.ok) {
-                read++;
-                if (hunter) readKillTimes.push(hunter.lastKillAt.getTime());
+        const previous = known.get(e.serial)!;
+        if (res.ok) {
+            const rawXp = res.data.character?.experience;
+            const profileXp = typeof rawXp === 'number' || (typeof rawXp === 'string' && /^\d+$/.test(rawXp))
+                ? Number(rawXp) : NaN;
+            const hunter = buildHunter(e.serial, res.data);
+            if (hunter) readKillTimes.push(hunter.lastKillAt.getTime());
+            const activity = previous.xpActivity;
+            if (activity?.awaitingProfile && profileXp !== activity.value) {
+                lagging++;
+                const lastKnownKill = previous.hunter?.lastKillAt.getTime() ?? -Infinity;
+                known.set(e.serial, {
+                    ...previous,
+                    attemptedAt,
+                    hunter: hunter && hunter.lastKillAt.getTime() > lastKnownKill ? hunter : previous.hunter,
+                    xpActivity: { ...activity, awaitingProfile: true, retryAt: attemptedAt + PROFILE_LAG_RETRY_MS },
+                });
             } else {
-                unavailable++;
+                known.set(e.serial, {
+                    serial: e.serial, rankingXp: previous.rankingXp, xp: e.xp, fetchedAt: attemptedAt, hunter,
+                    xpActivity: activity && { ...activity, awaitingProfile: false, retryAt: undefined },
+                });
             }
-            known.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: attemptedAt, hunter });
+            read++;
+        } else if (res.reason === 'gone') {
+            unavailable++;
+            const activity = previous.xpActivity;
+            known.set(e.serial, {
+                serial: e.serial, rankingXp: previous.rankingXp, xp: e.xp, fetchedAt: attemptedAt, hunter: null,
+                xpActivity: activity?.awaitingProfile ? { ...activity, retryAt: attemptedAt + STALE_MS } : activity,
+            });
         } else {
             // Keep the PX baseline and last valid data so a failed read can be retried.
-            known.set(e.serial, { ...known.get(e.serial)!, attemptedAt });
+            known.set(e.serial, { ...previous, attemptedAt });
             if (res.reason === 'exhausted') {
                 console.warn(`Profilo non recuperato dopo ${PROFILE_ATTEMPTS} tentativi: ${JSON.stringify(e.name)} (seriale ${e.serial})`);
             } else if (res.reason === 'rateLimited') {
@@ -289,7 +356,7 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
             if (res.reason !== 'rateLimited') failed++;
         }
         done++;
-        onProgress?.(done, toFetch.length);
+        options.onProgress?.(done, toFetch.length);
         if (!res.ok && res.reason === 'rateLimited') break;
         if (done < toFetch.length) await sleep(PACE_MS);
     }
@@ -308,10 +375,11 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
         return { ...t, hunter: { ...t.hunter, name: e.name, race: e.race, className: e.className, level } };
     });
     return {
-        snapshot: { updatedAt, tracked, fetched: done },
+        snapshot: { updatedAt: new Date(now), tracked, fetched: done },
         read,
         unavailable,
         failed,
+        lagging,
         deferred: toFetch.length - read - unavailable - failed,
         recentKills,
         olderKills: readKillTimes.length - recentKills,
