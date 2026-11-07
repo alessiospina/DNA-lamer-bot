@@ -1,5 +1,8 @@
-const BASE = 'https://dnashard.it/api/v1';
+const ORIGIN = 'https://dnashard.it';
+const BASE = `${ORIGIN}/api/v1`;
 const HEADERS = { 'User-Agent': 'DNA-lamer-bot (community tool)', Accept: 'application/json' };
+const SESSION_COOKIE = '__Host-dna_area=';
+let sessionCookie: string | undefined;
 
 /** The site answers 429 above roughly one request per second: pace the calls and back off on 429. */
 const PACE_MS = 900;
@@ -58,23 +61,53 @@ export interface Snapshot {
     fetched: number;
 }
 
-type Fetched<T> = { ok: true; data: T } | { ok: false; gone: boolean };
+type Fetched<T> = { ok: true; data: T } | { ok: false; reason: 'gone' | 'session' | 'transient' };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-/** `gone` means 401/403/404 (private or missing profile): definitive. Anything else is transient and worth a retry. */
-async function getJson<T>(path: string, attempts = MAX_ATTEMPTS, baseDelayMs = 1500): Promise<Fetched<T>> {
+async function login(): Promise<string> {
+    const username = process.env.DNA_USERNAME;
+    const password = process.env.DNA_PASSWORD;
+    if (!username || !password) throw new Error('Configura DNA_USERNAME e DNA_PASSWORD per leggere i profili DNA Shard');
+
+    const res = await fetch(`${BASE}/area/login`, {
+        method: 'POST',
+        redirect: 'error',
+        headers: { ...HEADERS, 'Content-Type': 'application/json', 'X-DNA-Portal': '1', Origin: ORIGIN },
+        body: JSON.stringify({ username, password }),
+        signal: AbortSignal.timeout(25_000),
+    });
+    const result = await res.json().catch(() => null) as { ok?: boolean } | null;
+    const cookie = res.headers.getSetCookie()
+        .map(header => header.split(';', 1)[0] ?? '')
+        .find(value => value.startsWith(SESSION_COOKIE) && value.length > SESSION_COOKIE.length);
+    if (!res.ok || result?.ok !== true || !cookie) throw new Error(`Accesso a DNA Shard fallito (HTTP ${res.status})`);
+    return cookie;
+}
+
+async function getJson<T>(path: string, attempts = MAX_ATTEMPTS, baseDelayMs = 1500, cookie?: string): Promise<Fetched<T>> {
     for (let attempt = 0; attempt < attempts; attempt++) {
         try {
-            const res = await fetch(`${BASE}${path}`, { headers: HEADERS, signal: AbortSignal.timeout(15_000) });
-            if (res.status === 404 || res.status === 401 || res.status === 403) return { ok: false, gone: true };
+            const res = await fetch(`${BASE}${path}`, {
+                headers: cookie ? { ...HEADERS, 'X-DNA-Portal': '1', Cookie: cookie } : HEADERS,
+                redirect: cookie ? 'error' : 'follow',
+                signal: AbortSignal.timeout(15_000),
+            });
+            if (res.status === 401) return { ok: false, reason: cookie ? 'session' : 'gone' };
+            if (res.status === 403) {
+                if (!cookie) return { ok: false, reason: 'gone' };
+                const body = await res.json().catch(() => null) as { error?: string } | null;
+                if (body?.error === 'session') return { ok: false, reason: 'session' };
+                return { ok: false, reason: 'transient' };
+            }
+            if (res.status === 404) return { ok: false, reason: 'gone' };
             if (res.ok) return { ok: true, data: (await res.json()) as T };
         } catch {
             // network error or timeout: retry below
         }
         if (attempt < attempts - 1) await sleep(baseDelayMs * 2 ** attempt);
     }
-    return { ok: false, gone: false };
+    return { ok: false, reason: 'transient' };
 }
 
 /** "Drow · Balestriere · 747.814 PX" -> 747814 (-2 when the format is not the expected one: it then always counts as changed). */
@@ -142,11 +175,25 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
 
     const fresh = new Map<number, Tracked>();
     let done = 0;
+    let renewedSession = false;
     for (const e of toFetch) {
-        const res = await getJson<ProfileResponse>(`/profile/${e.serial}`);
+        sessionCookie ??= await login();
+        const path = `/profile/${e.serial}`;
+        let res = await getJson<ProfileResponse>(path, MAX_ATTEMPTS, 1500, sessionCookie);
+        if (!res.ok && res.reason === 'session' && !renewedSession) {
+            renewedSession = true;
+            sessionCookie = undefined;
+            await sleep(PACE_MS);
+            sessionCookie = await login();
+            res = await getJson<ProfileResponse>(path, MAX_ATTEMPTS, 1500, sessionCookie);
+        }
+        if (!res.ok && res.reason === 'session') {
+            sessionCookie = undefined;
+            throw new Error('Sessione DNA Shard rifiutata dopo il rinnovo');
+        }
         // A transient failure keeps the previous state (or xp -1 for a new player): the PX mismatch makes the next refresh retry.
         if (res.ok) fresh.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: Date.now(), hunter: buildHunter(e.serial, res.data) });
-        else if (res.gone) fresh.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: Date.now(), hunter: null });
+        else if (res.reason === 'gone') fresh.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: Date.now(), hunter: null });
         onProgress?.(++done, toFetch.length);
         await sleep(PACE_MS);
     }
