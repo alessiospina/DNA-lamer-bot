@@ -56,6 +56,7 @@ export interface XpActivity {
     serial: number;
     name: string;
     value: number;
+    delta?: number;
     observedAt: number;
     awaitingProfile: boolean;
     retryAt?: number;
@@ -210,14 +211,6 @@ function buildHunter(serial: number, profile: ProfileResponse): Hunter | null {
     };
 }
 
-/** Players with a known kill, most recent first. */
-export function getHunters(snapshot: Snapshot): Hunter[] {
-    return snapshot.tracked
-        .map(t => t.hunter)
-        .filter((h): h is Hunter => h !== null)
-        .sort((a, b) => b.lastKillAt.getTime() - a.lastKillAt.getTime());
-}
-
 /**
  * One request reads the "Progressione" ranking, which carries every player's PX. Only the profiles of players whose PX changed (plus a few of
  * the oldest ones) are reopened; the first run, without a previous snapshot, opens all of them.
@@ -259,7 +252,7 @@ export async function refresh(prev: Snapshot | null, options: RefreshOptions = {
         let activity = options.resetBaseline ? undefined : p.xpActivity;
         if (!options.resetBaseline && e.xp >= 0 && previousXp !== undefined && previousXp !== e.xp) {
             activity = {
-                serial: e.serial, name: e.name, value: e.xp, observedAt: now,
+                serial: e.serial, name: e.name, value: e.xp, delta: e.xp - previousXp, observedAt: now,
                 awaitingProfile: true, retryAt: activity?.retryAt,
             };
         }

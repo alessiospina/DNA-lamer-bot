@@ -1,6 +1,6 @@
 import { ChatInputCommandInteraction, Client, EmbedBuilder, GatewayIntentBits, MessageFlags, SlashCommandBuilder } from 'discord.js';
 import { randomPhrase } from './phrases.js';
-import { type Hunter, type Snapshot, DEFAULT_WINDOW_MINUTES, MAX_WINDOW_MINUTES, fetchStatus, getDnaCooldownUntil, getHunters, refresh } from './scraper.js';
+import { type Snapshot, DEFAULT_WINDOW_MINUTES, MAX_WINDOW_MINUTES, fetchStatus, getDnaCooldownUntil, refresh } from './scraper.js';
 import { loadSnapshot, saveSnapshot } from './store.js';
 
 try {
@@ -33,6 +33,7 @@ const IDLE_MINUTES = 60;
 const MINUTE_MS = 60_000;
 const TIME_ZONE = 'Europe/Rome';
 const EMBED_LIMIT = 3800;
+const formatPxDelta = new Intl.NumberFormat('it-IT', { signDisplay: 'always' });
 
 const command = new SlashCommandBuilder()
     .setName('trovasgub')
@@ -62,7 +63,7 @@ const INFO_FIELDS = [
     {
         name: '/trovasgub  ·  [minuti]',
         value: [
-            'Le kill confermate mostrano mob e orario. Segnalo anche i PG con PX cambiati, quando i dettagli della kill non sono disponibili.',
+            'Ogni PG ha una riga con mob e orario, oppure con la differenza di PX tra due letture della classifica.',
             'DNA Shard aggiorna i profili una volta all’ora. L’ora indicata per un cambio di PX è quella in cui l’ho rilevato.',
             `Di default guardo gli ultimi ${DEFAULT_WINDOW_MINUTES} minuti. Puoi scegliere una finestra da 1 a ${MAX_WINDOW_MINUTES} minuti, per esempio \`/trovasgub minuti:${MAX_WINDOW_MINUTES}\`.`,
         ].join('\n'),
@@ -155,34 +156,11 @@ async function runRefresh(): Promise<void> {
 
 const unix = (d: Date) => Math.floor(d.getTime() / 1000);
 
-function line(h: Hunter, i: number): string {
-    return `**${i + 1}. ${h.name}** · Lv ${h.level} · ${h.race} ${h.className}\n└ ${h.lastMob} · <t:${unix(h.lastKillAt)}:R>`;
-}
-
-function pages(lines: string[]): string[] {
-    const out: string[] = [];
-    let cur = '';
-    for (const l of lines) {
-        if (cur && cur.length + l.length + 1 > EMBED_LIMIT) {
-            out.push(cur);
-            cur = '';
-        }
-        cur += (cur ? '\n' : '') + l;
-    }
-    if (cur) out.push(cur);
-    return out;
-}
-
 async function handleTrovasgub(interaction: ChatInputCommandInteraction): Promise<void> {
     const waking = wakeForTrovasgub();
     const minutes = Math.min(interaction.options.getInteger('minuti') ?? DEFAULT_WINDOW_MINUTES, MAX_WINDOW_MINUTES);
     const threshold = Date.now() - minutes * MINUTE_MS;
     const result = baselinePending ? null : snapshot;
-    const active = result ? getHunters(result).filter(h => h.lastKillAt.getTime() >= threshold) : [];
-    const confirmed = new Set(active.map(h => h.serial));
-    const xpChanges = (result?.tracked.flatMap(t => t.xpActivity ? [t.xpActivity] : []) ?? [])
-        .filter(p => p.observedAt >= threshold && (p.awaitingProfile || !confirmed.has(p.serial)))
-        .sort((a, b) => b.observedAt - a.observedAt);
     if (!result) {
         const where = progress ? ` (${progress.done}/${progress.total} profili elaborati)` : '';
         const loading = waking ? 'Stavo ronfando! Mi rimetto a caccia' : 'I primi dati sono ancora in preparazione';
@@ -196,7 +174,24 @@ async function handleTrovasgub(interaction: ChatInputCommandInteraction): Promis
     const time = updatedAt.toLocaleTimeString('it-IT', { timeZone: TIME_ZONE });
     const footer = `Classifica letta alle ${time} · ${result.tracked.length} player seguiti`;
 
-    if (active.length === 0 && xpChanges.length === 0) {
+    const rows: { name: string; detail: string; at: number }[] = [];
+    for (const { hunter, xpActivity } of result.tracked) {
+        const change = xpActivity && xpActivity.observedAt >= threshold ? xpActivity : undefined;
+        const killAt = hunter?.lastKillAt.getTime() ?? -Infinity;
+        if (hunter && killAt >= threshold && (!change?.awaitingProfile || killAt >= change.observedAt)) {
+            rows.push({
+                name: hunter.name,
+                detail: `Lv ${hunter.level} · ${hunter.race} ${hunter.className} · ${hunter.lastMob}`,
+                at: killAt,
+            });
+        } else if (change) {
+            const detail = change.delta === undefined ? 'PX cambiati' : `${formatPxDelta.format(change.delta)} PX`;
+            rows.push({ name: change.name, detail, at: change.observedAt });
+        }
+    }
+    rows.sort((a, b) => b.at - a.at);
+
+    if (rows.length === 0) {
         await interaction.reply({
             embeds: [
                 new EmbedBuilder()
@@ -208,24 +203,29 @@ async function handleTrovasgub(interaction: ChatInputCommandInteraction): Promis
         return;
     }
 
-    const sections = [
-        { title: `Kill confermate · ultimi ${minutes} min (${active.length})`, lines: active.map(line) },
-        {
-            title: `PX cambiati · ultimi ${minutes} min (${xpChanges.length})`,
-            lines: xpChanges.map(p => {
-                const details = p.awaitingProfile ? 'dettagli in attesa' : 'nessuna kill nella finestra';
-                return `**${p.name}** · cambio rilevato <t:${Math.floor(p.observedAt / 1000)}:R> · ${details}`;
-            }),
-        },
-    ];
-    const embeds = sections.flatMap(({ title, lines }) => pages(lines).map((description, i) => {
-        const embed = new EmbedBuilder().setDescription(description);
-        if (i === 0) embed.setTitle(title);
-        return embed;
-    }));
-    embeds.at(-1)?.setFooter({ text: footer }).setTimestamp(updatedAt);
-    await interaction.reply({ embeds: [embeds[0]!] });
-    for (const e of embeds.slice(1)) await interaction.followUp({ embeds: [e] });
+    let description = '';
+    let shown = 0;
+    for (const row of rows) {
+        const line = `**${shown + 1}. ${row.name}** · ${row.detail} · <t:${Math.floor(row.at / 1000)}:R>`;
+        if (description.length + line.length + 1 > EMBED_LIMIT) break;
+        description += (description ? '\n' : '') + line;
+        shown++;
+    }
+    const files = [];
+    if (shown < rows.length) {
+        description += `\n\nMostro ${shown} di ${rows.length} PG. Elenco completo in allegato.`;
+        const fullList = rows.map((row, i) => {
+            const at = new Date(row.at).toLocaleTimeString('it-IT', { timeZone: TIME_ZONE });
+            return `${i + 1}. ${row.name} · ${row.detail} · ${at}`;
+        }).join('\n');
+        files.push({ attachment: Buffer.from(fullList), name: 'trovasgub.txt' });
+    }
+    const embed = new EmbedBuilder()
+        .setTitle(`Attività · ultimi ${minutes} min (${rows.length})`)
+        .setDescription(description)
+        .setFooter({ text: footer })
+        .setTimestamp(updatedAt);
+    await interaction.reply({ embeds: [embed], files });
 }
 
 async function handlePlayer(interaction: ChatInputCommandInteraction): Promise<void> {
