@@ -5,8 +5,8 @@ const SESSION_COOKIE = '__Host-dna_area=';
 let sessionCookie: string | undefined;
 let resumeAt = 0;
 
-/** The site answers 429 above roughly one request per second: pace the calls and back off on 429. */
-const PACE_MS = 1_500;
+/** Space out profile reads and back off when the site returns 429. */
+const PACE_MS = 3_000;
 const MAX_ATTEMPTS = 6;
 const PROFILE_ATTEMPTS = 2;
 const PROFILE_TIMEOUT_MS = 5_000;
@@ -73,6 +73,10 @@ interface RefreshResult {
     unavailable: number;
     failed: number;
     deferred: number;
+    recentKills: number;
+    olderKills: number;
+    noKill: number;
+    latestKillAt: Date | null;
 }
 
 type Fetched<T> = { ok: true; data: T } | { ok: false; reason: 'gone' | 'session' | 'transient' | 'exhausted' | 'rateLimited' };
@@ -241,6 +245,7 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
     let read = 0;
     let unavailable = 0;
     let failed = 0;
+    const readKillTimes: number[] = [];
     let renewedSession = false;
     const readProfile = (serial: number, cookie: string) => getJson<ProfileResponse>(
         `/profile/${serial}`, { attempts: PROFILE_ATTEMPTS, timeoutMs: PROFILE_TIMEOUT_MS, cookie },
@@ -265,8 +270,12 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
         const attemptedAt = Date.now();
         if (res.ok || res.reason === 'gone') {
             const hunter = res.ok ? buildHunter(e.serial, res.data) : null;
-            if (res.ok) read++;
-            else unavailable++;
+            if (res.ok) {
+                read++;
+                if (hunter) readKillTimes.push(hunter.lastKillAt.getTime());
+            } else {
+                unavailable++;
+            }
             known.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: attemptedAt, hunter });
         } else {
             // Keep the PX baseline and last valid data so a failed read can be retried.
@@ -286,6 +295,8 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
 
     // Name, race, class and level always come from the ranking, so they are current even when the profile was not reopened.
     const cutoff = Date.now() - MAX_WINDOW_MINUTES * 60_000;
+    const recentKills = readKillTimes.filter(at => at >= cutoff).length;
+    const latestKillTime = readKillTimes.reduce((latest, at) => Math.max(latest, at), -Infinity);
     const tracked = entries.map(e => {
         const t = known.get(e.serial)!;
         if (!t.hunter) return t;
@@ -299,6 +310,10 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
         unavailable,
         failed,
         deferred: toFetch.length - read - unavailable - failed,
+        recentKills,
+        olderKills: readKillTimes.length - recentKills,
+        noKill: read - readKillTimes.length,
+        latestKillAt: Number.isFinite(latestKillTime) ? new Date(latestKillTime) : null,
     };
 }
 

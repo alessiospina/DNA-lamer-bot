@@ -160,6 +160,8 @@ async function runRefresh(): Promise<void> {
         const recentKills = snapshot.tracked.filter(t => t.hunter).length;
         const seconds = ((performance.now() - startedAt) / 1_000).toFixed(1);
         console.log(`Aggiornamento in ${seconds}s: ${result.read} profili letti, ${result.unavailable} privati o assenti, ${result.failed} falliti, ${result.deferred} rimandati. ${snapshot.tracked.length} seguiti, ${recentKills} con kill negli ultimi ${MAX_WINDOW_MINUTES} minuti.`);
+        const latestKill = result.latestKillAt?.toLocaleString('it-IT', { timeZone: TIME_ZONE }) ?? 'nessuna';
+        console.log(`Kill nei profili letti: ${result.recentKills} entro ${MAX_WINDOW_MINUTES} min, ${result.olderKills} più vecchie, ${result.noKill} senza kill rilevate. Più recente (ora italiana): ${latestKill}.`);
     } catch (err) {
         console.error('Aggiornamento fallito, resta lo snapshot precedente', err);
     } finally {
