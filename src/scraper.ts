@@ -3,13 +3,19 @@ const BASE = `${ORIGIN}/api/v1`;
 const HEADERS = { 'User-Agent': 'DNA-lamer-bot (community tool)', Accept: 'application/json' };
 const SESSION_COOKIE = '__Host-dna_area=';
 let sessionCookie: string | undefined;
+let resumeAt = 0;
 
 /** The site answers 429 above roughly one request per second: pace the calls and back off on 429. */
 const PACE_MS = 900;
 const MAX_ATTEMPTS = 6;
+const PROFILE_ATTEMPTS = 2;
+const PROFILE_TIMEOUT_MS = 5_000;
+const MAX_INLINE_COOLDOWN_MS = 5_000;
+const DEFAULT_RATE_LIMIT_PAUSE_MS = 30_000;
 /** A profile whose PX did not move is reopened anyway after this long, at most STALE_PER_CYCLE per refresh (safety net for kills that give no PX). */
 const STALE_MS = 20 * 60_000;
 const STALE_PER_CYCLE = 4;
+export const MAX_WINDOW_MINUTES = 24 * 60;
 
 interface RankingEntry {
     rank: number;
@@ -41,16 +47,16 @@ export interface Hunter {
     level: number;
     lastKillAt: Date;
     lastMob: string;
-    /** Last distinct mobs killed, most recent first. */
-    recentMobs: { name: string; at: Date }[];
 }
 
-/** What we know about one player of the ranking. `hunter` is null for private profiles and for players without kills. */
+/** The ranking baseline and, when available, the latest kill within the supported window. */
 export interface Tracked {
     serial: number;
     /** PX shown by the ranking when the profile was read: a different value means the player did something. */
     xp: number;
     fetchedAt: number;
+    /** Last profile attempt, including failures. Older snapshots fall back to fetchedAt. */
+    attemptedAt?: number;
     hunter: Hunter | null;
 }
 
@@ -61,11 +67,34 @@ export interface Snapshot {
     fetched: number;
 }
 
-type Fetched<T> = { ok: true; data: T } | { ok: false; reason: 'gone' | 'session' | 'transient' };
+type Fetched<T> = { ok: true; data: T } | { ok: false; reason: 'gone' | 'session' | 'transient' | 'exhausted' | 'rateLimited' };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function login(): Promise<string> {
+export function getDnaCooldownUntil(): number {
+    return resumeAt;
+}
+
+function isDnaCoolingDown(): boolean {
+    return Date.now() < resumeAt;
+}
+
+function applyRateLimit(res: Response, path: string): boolean {
+    if (res.status !== 429) return false;
+    const now = Date.now();
+    const retryAfter = res.headers.get('Retry-After');
+    const delay = retryAfter && /^\d+$/.test(retryAfter)
+        ? Number(retryAfter) * 1000
+        : Date.parse(retryAfter ?? '') - now;
+    const pause = Number.isFinite(delay) ? Math.max(PACE_MS, delay) : DEFAULT_RATE_LIMIT_PAUSE_MS;
+    resumeAt = Math.max(resumeAt, now + pause);
+    void res.body?.cancel().catch(() => {});
+    console.warn(`DNA Shard ha risposto 429 su ${path}, richieste sospese per almeno ${Math.ceil((resumeAt - now) / 1000)}s`);
+    return true;
+}
+
+async function login(): Promise<string | undefined> {
+    if (isDnaCoolingDown()) return;
     const username = process.env.DNA_USERNAME;
     const password = process.env.DNA_PASSWORD;
     if (!username || !password) throw new Error('Configura DNA_USERNAME e DNA_PASSWORD per leggere i profili DNA Shard');
@@ -77,6 +106,7 @@ async function login(): Promise<string> {
         body: JSON.stringify({ username, password }),
         signal: AbortSignal.timeout(25_000),
     });
+    if (applyRateLimit(res, '/area/login')) return;
     const result = await res.json().catch(() => null) as { ok?: boolean } | null;
     const cookie = res.headers.getSetCookie()
         .map(header => header.split(';', 1)[0] ?? '')
@@ -85,14 +115,31 @@ async function login(): Promise<string> {
     return cookie;
 }
 
-async function getJson<T>(path: string, attempts = MAX_ATTEMPTS, baseDelayMs = 1500, cookie?: string): Promise<Fetched<T>> {
+interface JsonOptions {
+    attempts?: number;
+    baseDelayMs?: number;
+    timeoutMs?: number;
+    cookie?: string;
+}
+
+async function getJson<T>(path: string, options: JsonOptions = {}): Promise<Fetched<T>> {
+    const { attempts = MAX_ATTEMPTS, baseDelayMs = 1500, timeoutMs = 15_000, cookie } = options;
     for (let attempt = 0; attempt < attempts; attempt++) {
+        if (isDnaCoolingDown()) return { ok: false, reason: 'rateLimited' };
         try {
             const res = await fetch(`${BASE}${path}`, {
                 headers: cookie ? { ...HEADERS, 'X-DNA-Portal': '1', Cookie: cookie } : HEADERS,
                 redirect: cookie ? 'error' : 'follow',
-                signal: AbortSignal.timeout(15_000),
+                signal: AbortSignal.timeout(timeoutMs),
             });
+            if (applyRateLimit(res, path)) {
+                const wait = Math.max(0, resumeAt - Date.now());
+                if (!cookie || attempt === attempts - 1 || wait > MAX_INLINE_COOLDOWN_MS) {
+                    return { ok: false, reason: 'rateLimited' };
+                }
+                await sleep(wait);
+                continue;
+            }
             if (res.status === 401) return { ok: false, reason: cookie ? 'session' : 'gone' };
             if (res.status === 403) {
                 if (!cookie) return { ok: false, reason: 'gone' };
@@ -107,7 +154,7 @@ async function getJson<T>(path: string, attempts = MAX_ATTEMPTS, baseDelayMs = 1
         }
         if (attempt < attempts - 1) await sleep(baseDelayMs * 2 ** attempt);
     }
-    return { ok: false, reason: 'transient' };
+    return { ok: false, reason: 'exhausted' };
 }
 
 /** "Drow · Balestriere · 747.814 PX" -> 747814 (-2 when the format is not the expected one: it then always counts as changed). */
@@ -118,11 +165,11 @@ function parsePx(detail: string): number {
 
 function buildHunter(serial: number, profile: ProfileResponse): Hunter | null {
     if (!Array.isArray(profile.kinds)) return null;
-    const kinds = profile.kinds
-        .map(k => ({ name: k.name, at: new Date(k.lastAt) }))
-        .filter(k => Number.isFinite(k.at.getTime()))
-        .sort((a, b) => b.at.getTime() - a.at.getTime());
-    const last = kinds[0];
+    let last: { name: string; at: number } | undefined;
+    for (const kind of profile.kinds) {
+        const at = Date.parse(kind.lastAt);
+        if (Number.isFinite(at) && (!last || at > last.at)) last = { name: kind.name, at };
+    }
     if (!last) return null;
     return {
         serial,
@@ -130,9 +177,8 @@ function buildHunter(serial: number, profile: ProfileResponse): Hunter | null {
         race: profile.character.race,
         className: profile.character.class,
         level: profile.character.level,
-        lastKillAt: last.at,
+        lastKillAt: new Date(last.at),
         lastMob: last.name,
-        recentMobs: kinds.slice(0, 3),
     };
 }
 
@@ -152,7 +198,10 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
     const updatedAt = new Date();
     const rankings = await getJson<{ boards: { id: string; entries: RankingEntry[] }[] }>('/rankings');
     const board = rankings.ok ? rankings.data.boards.find(b => b.id === 'livello') : undefined;
-    if (!board) throw new Error('Classifica Progressione non disponibile');
+    if (!board) {
+        if (!rankings.ok && rankings.reason === 'rateLimited') throw new Error('Classifica Progressione rimandata per limite richieste');
+        throw new Error('Classifica Progressione non disponibile');
+    }
 
     const entries = board.entries.flatMap(e => {
         if (typeof e.serial !== 'number') return [];
@@ -167,45 +216,69 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
     const stale: typeof entries = [];
     for (const e of entries) {
         const p = known.get(e.serial);
+        if (!p) known.set(e.serial, { serial: e.serial, xp: -1, fetchedAt: 0, hunter: null });
         if (!p || p.xp !== e.xp) changed.push(e);
         else if (now - p.fetchedAt > STALE_MS) stale.push(e);
     }
-    stale.sort((a, b) => known.get(a.serial)!.fetchedAt - known.get(b.serial)!.fetchedAt);
+    const lastAttempt = (serial: number) => {
+        const player = known.get(serial)!;
+        return player.attemptedAt ?? player.fetchedAt;
+    };
+    changed.sort((a, b) => lastAttempt(a.serial) - lastAttempt(b.serial));
+    stale.sort((a, b) => lastAttempt(a.serial) - lastAttempt(b.serial));
     const toFetch = [...changed, ...stale.slice(0, STALE_PER_CYCLE)];
 
-    const fresh = new Map<number, Tracked>();
     let done = 0;
     let renewedSession = false;
+    const readProfile = (serial: number, cookie: string) => getJson<ProfileResponse>(
+        `/profile/${serial}`, { attempts: PROFILE_ATTEMPTS, timeoutMs: PROFILE_TIMEOUT_MS, cookie },
+    );
     for (const e of toFetch) {
+        if (isDnaCoolingDown()) break;
         sessionCookie ??= await login();
-        const path = `/profile/${e.serial}`;
-        let res = await getJson<ProfileResponse>(path, MAX_ATTEMPTS, 1500, sessionCookie);
+        if (!sessionCookie) break;
+        let res = await readProfile(e.serial, sessionCookie);
         if (!res.ok && res.reason === 'session' && !renewedSession) {
             renewedSession = true;
             sessionCookie = undefined;
             await sleep(PACE_MS);
             sessionCookie = await login();
-            res = await getJson<ProfileResponse>(path, MAX_ATTEMPTS, 1500, sessionCookie);
+            if (!sessionCookie) break;
+            res = await readProfile(e.serial, sessionCookie);
         }
         if (!res.ok && res.reason === 'session') {
             sessionCookie = undefined;
             throw new Error('Sessione DNA Shard rifiutata dopo il rinnovo');
         }
-        // A transient failure keeps the previous state (or xp -1 for a new player): the PX mismatch makes the next refresh retry.
-        if (res.ok) fresh.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: Date.now(), hunter: buildHunter(e.serial, res.data) });
-        else if (res.reason === 'gone') fresh.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: Date.now(), hunter: null });
-        onProgress?.(++done, toFetch.length);
+        const attemptedAt = Date.now();
+        if (res.ok || res.reason === 'gone') {
+            const hunter = res.ok ? buildHunter(e.serial, res.data) : null;
+            known.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: attemptedAt, hunter });
+        } else {
+            // Keep the PX baseline and last valid data so a failed read can be retried.
+            known.set(e.serial, { ...known.get(e.serial)!, attemptedAt });
+            if (res.reason === 'exhausted') {
+                console.warn(`Profilo non recuperato dopo ${PROFILE_ATTEMPTS} tentativi: ${JSON.stringify(e.name)} (seriale ${e.serial})`);
+            } else if (res.reason === 'rateLimited') {
+                console.warn(`Profilo rimandato per limite richieste: ${JSON.stringify(e.name)} (seriale ${e.serial})`);
+            }
+        }
+        done++;
+        onProgress?.(done, toFetch.length);
+        if (!res.ok && res.reason === 'rateLimited') break;
         await sleep(PACE_MS);
     }
 
     // Name, race, class and level always come from the ranking, so they are current even when the profile was not reopened.
+    const cutoff = Date.now() - MAX_WINDOW_MINUTES * 60_000;
     const tracked = entries.map(e => {
-        const t = fresh.get(e.serial) ?? known.get(e.serial) ?? { serial: e.serial, xp: -1, fetchedAt: 0, hunter: null };
+        const t = known.get(e.serial)!;
         if (!t.hunter) return t;
+        if (t.hunter.lastKillAt.getTime() < cutoff) return { ...t, hunter: null };
         const level = Number.isFinite(e.level) ? e.level : t.hunter.level;
         return { ...t, hunter: { ...t.hunter, name: e.name, race: e.race, className: e.className, level } };
     });
-    return { updatedAt, tracked, fetched: toFetch.length };
+    return { updatedAt, tracked, fetched: done };
 }
 
 export interface ServerStatus {
@@ -217,7 +290,9 @@ export interface ServerStatus {
 
 /** Reads the number of players from the homepage's status API. Few fast attempts: it is called while a user waits. */
 export async function fetchStatus(): Promise<ServerStatus | null> {
-    const res = await getJson<{ status?: string; players?: number; playersPeak24h?: number | null; reportedAt?: number }>('/status', 4, 700);
+    const res = await getJson<{ status?: string; players?: number; playersPeak24h?: number | null; reportedAt?: number }>(
+        '/status', { attempts: 4, baseDelayMs: 700 },
+    );
     if (!res.ok) return null;
     const data = res.data;
     if ((data.status !== 'online' && data.status !== 'offline') || typeof data.players !== 'number') return null;

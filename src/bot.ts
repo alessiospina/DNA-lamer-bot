@@ -1,6 +1,6 @@
 import { ChatInputCommandInteraction, Client, EmbedBuilder, GatewayIntentBits, MessageFlags, SlashCommandBuilder } from 'discord.js';
 import { randomPhrase } from './phrases.js';
-import { type Hunter, type Snapshot, fetchStatus, getHunters, refresh } from './scraper.js';
+import { type Hunter, type Snapshot, MAX_WINDOW_MINUTES, fetchStatus, getDnaCooldownUntil, getHunters, refresh } from './scraper.js';
 import { loadSnapshot, saveSnapshot } from './store.js';
 
 try {
@@ -29,14 +29,24 @@ if (!token) {
 }
 
 const DEFAULT_WINDOW_MIN = 60;
-const REFRESH_INTERVAL_MS = 2 * 60_000;
+const PEAK_START_HOUR = 10;
+const PEAK_END_HOUR = 1;
+const SNOOZE_START_HOUR = 3;
+const PEAK_REFRESH_MINUTES = 2;
+const OFF_PEAK_REFRESH_MINUTES = 10;
+const MORNING_IDLE_MINUTES = 15;
+const IDLE_MINUTES = 60;
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const TIME_ZONE = 'Europe/Rome';
+const romeHour = new Intl.DateTimeFormat('it-IT', { timeZone: TIME_ZONE, hour: 'numeric', hourCycle: 'h23' });
 const EMBED_LIMIT = 3800;
 
 const command = new SlashCommandBuilder()
     .setName('trovasgub')
     .setDescription("Mostra i player che stanno cacciando adesso, con l'ultimo mob ucciso")
     .addIntegerOption(o =>
-        o.setName('minuti').setDescription(`Finestra di attività in minuti (default ${DEFAULT_WINDOW_MIN})`).setMinValue(1).setMaxValue(1440),
+        o.setName('minuti').setDescription(`Finestra di attività in minuti (default ${DEFAULT_WINDOW_MIN})`).setMinValue(1).setMaxValue(MAX_WINDOW_MINUTES),
     );
 
 const playerCommand = new SlashCommandBuilder().setName('player').setDescription('Quanti player ci sono online adesso, con un invito alla violenza');
@@ -45,11 +55,21 @@ const infoCommand = new SlashCommandBuilder().setName('info').setDescription('Co
 
 const INFO_DESCRIPTION = [
     'Sono il bot che tiene d\'occhio i farmatori di Alseran, perché qualcuno deve pur farlo e a te piace PKappare.',
-    'Ogni 2 minuti guardo la classifica: quando i PX di un nerd si muovono, gli apro il profilo e annoto l\'ultimo mob che ha massacrato e a che ora.',
+    'Quando i PX di un nerd si muovono, gli apro il profilo e annoto l\'ultimo mob che ha massacrato e a che ora.',
     'Zero fatica per te, zero dignità per loro.',
 ].join('\n');
 
 const INFO_FIELDS = [
+    {
+        name: 'Quando aggiorno i dati · ora italiana',
+        value: [
+            `${PEAK_START_HOUR}:00–0${PEAK_END_HOUR}:00 · ogni ${PEAK_REFRESH_MINUTES} minuti.`,
+            `0${PEAK_END_HOUR}:00–0${SNOOZE_START_HOUR}:00 · ogni ${OFF_PEAK_REFRESH_MINUTES} minuti.`,
+            `0${SNOOZE_START_HOUR}:00–${PEAK_START_HOUR}:00 · parto in pausa. Se mi svegli, aggiorno ogni ${OFF_PEAK_REFRESH_MINUTES} minuti e torno a dormire dopo ${MORNING_IDLE_MINUTES} minuti senza \`/trovasgub\`.`,
+            `Nelle altre fasce mi addormento dopo ${IDLE_MINUTES} minuti senza \`/trovasgub\`.`,
+            'Se sto dormendo, solo `/trovasgub` mi sveglia. Ti chiedo di riprovare tra qualche minuto, appena ho aggiornato i dati.',
+        ].join('\n'),
+    },
     {
         name: '/trovasgub  ·  [minuti]',
         value: [
@@ -71,9 +91,65 @@ let snapshot: Snapshot | null = loadSnapshot();
 if (snapshot) console.log(`Snapshot caricato da file (${snapshot.updatedAt.toISOString()})`);
 let refreshing = false;
 let progress: { done: number; total: number } | null = null;
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+let lastRefreshStartedAt = -Infinity;
+let lastTrovasgubAt = Date.now();
+let awakeUntil = lastTrovasgubAt + IDLE_MINUTES * MINUTE_MS;
+let wasMorning = false;
+let wakeRefreshPending = false;
+
+function isSnoozeHour(hour: number): boolean {
+    return hour >= SNOOZE_START_HOUR && hour < PEAK_START_HOUR;
+}
+
+function updateSnooze(now: number, hour: number): void {
+    const morning = isSnoozeHour(hour);
+    if (now >= awakeUntil || (morning && !wasMorning)) {
+        awakeUntil = 0;
+    } else if (!morning && wasMorning) {
+        awakeUntil = lastTrovasgubAt + IDLE_MINUTES * MINUTE_MS;
+    }
+    wasMorning = morning;
+}
+
+function scheduleRefresh(): void {
+    clearTimeout(refreshTimer);
+    if (refreshing) return;
+
+    const now = Date.now();
+    const hour = Number(romeHour.format(now));
+    updateSnooze(now, hour);
+    const interval = hour >= PEAK_START_HOUR || hour < PEAK_END_HOUR
+        ? PEAK_REFRESH_MINUTES : OFF_PEAK_REFRESH_MINUTES;
+    const dueAt = Math.max(lastRefreshStartedAt + interval * MINUTE_MS, getDnaCooldownUntil());
+    if (now < awakeUntil && now >= dueAt) {
+        lastRefreshStartedAt = now;
+        void runRefresh().finally(scheduleRefresh);
+        return;
+    }
+
+    // Rome's clock and its DST changes align with UTC hour boundaries.
+    const nextHour = (Math.floor(now / HOUR_MS) + 1) * HOUR_MS;
+    const nextCheck = now < awakeUntil ? Math.min(nextHour, dueAt, awakeUntil) : nextHour;
+    refreshTimer = setTimeout(scheduleRefresh, nextCheck - now);
+}
+
+function wakeForTrovasgub(): boolean {
+    const now = Date.now();
+    const hour = Number(romeHour.format(now));
+    updateSnooze(now, hour);
+    if (now >= awakeUntil) {
+        wakeRefreshPending = true;
+        if (!refreshing) lastRefreshStartedAt = -Infinity;
+    }
+    lastTrovasgubAt = now;
+    const idleMinutes = isSnoozeHour(hour) ? MORNING_IDLE_MINUTES : IDLE_MINUTES;
+    awakeUntil = now + idleMinutes * MINUTE_MS;
+    scheduleRefresh();
+    return wakeRefreshPending;
+}
 
 async function runRefresh(): Promise<void> {
-    if (refreshing) return;
     refreshing = true;
     try {
         const result = await refresh(snapshot, (done, total) => {
@@ -81,8 +157,9 @@ async function runRefresh(): Promise<void> {
         });
         snapshot = result;
         saveSnapshot(result);
-        const noData = result.tracked.filter(t => !t.hunter).length;
-        console.log(`Aggiornamento: ${result.fetched} profili riaperti, ${result.tracked.length} seguiti, ${noData} senza dati`);
+        if (Date.now() >= getDnaCooldownUntil()) wakeRefreshPending = false;
+        const recentKills = result.tracked.filter(t => t.hunter).length;
+        console.log(`Aggiornamento: ${result.fetched} profili riaperti, ${result.tracked.length} seguiti, ${recentKills} con kill nelle ultime 24 ore`);
     } catch (err) {
         console.error('Aggiornamento fallito, resta lo snapshot precedente', err);
     } finally {
@@ -112,20 +189,21 @@ function pages(lines: string[]): string[] {
 }
 
 async function handleTrovasgub(interaction: ChatInputCommandInteraction): Promise<void> {
-    const minutes = interaction.options.getInteger('minuti') ?? DEFAULT_WINDOW_MIN;
-    if (!snapshot) {
+    const waking = wakeForTrovasgub();
+    if (waking || !snapshot) {
         const where = progress ? ` (${progress.done}/${progress.total} profili letti)` : '';
+        const loading = waking ? 'Stavo ronfando! Mi rimetto a caccia' : 'I primi dati sono ancora in preparazione';
         await interaction.reply({
-            content: `Sto ancora facendo la prima scansione${where}. La prima volta richiede fino a circa 8 minuti, poi i dati restano in memoria e le risposte sono immediate.`,
+            content: `${loading}${where}. Riprova tra qualche minuto.`,
             flags: MessageFlags.Ephemeral,
         });
         return;
     }
+    const minutes = interaction.options.getInteger('minuti') ?? DEFAULT_WINDOW_MIN;
     const result = snapshot;
     const threshold = Date.now() - minutes * 60_000;
     const active = getHunters(result).filter(h => h.lastKillAt.getTime() >= threshold);
-    const noData = result.tracked.filter(t => !t.hunter).length;
-    const footer = `Aggiornato alle ${result.updatedAt.toLocaleTimeString('it-IT', { timeZone: 'Europe/Rome' })} · ${result.tracked.length} player seguiti, ${noData} senza dati`;
+    const footer = `Aggiornato alle ${result.updatedAt.toLocaleTimeString('it-IT', { timeZone: TIME_ZONE })} · ${result.tracked.length} player seguiti`;
 
     if (active.length === 0) {
         await interaction.reply({
@@ -171,7 +249,7 @@ async function handleInfo(interaction: ChatInputCommandInteraction): Promise<voi
         .setTitle("DNA-lamer-bot · istruzioni per l'uso (per chi sa leggere)")
         .setDescription(INFO_DESCRIPTION)
         .addFields(INFO_FIELDS)
-        .setFooter({ text: 'Dati: dnashard.it, aggiornati ogni 2 minuti · il tuo karma è affar tuo' });
+        .setFooter({ text: 'Dati: dnashard.it · il tuo karma è affar tuo' });
     await interaction.reply({ embeds: [embed] });
 }
 
@@ -199,5 +277,4 @@ client.on('interactionCreate', interaction => {
 });
 
 await client.login(token);
-void runRefresh();
-setInterval(() => void runRefresh(), REFRESH_INTERVAL_MS);
+scheduleRefresh();

@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { Hunter, Snapshot } from './scraper.js';
+import { MAX_WINDOW_MINUTES, type Hunter, type Snapshot } from './scraper.js';
 
 const DATA_DIR = fileURLToPath(new URL('../data/', import.meta.url));
 const FILE = `${DATA_DIR}snapshot.json`;
@@ -19,11 +19,12 @@ export function saveSnapshot(snapshot: Snapshot): void {
 export function loadSnapshot(): Snapshot | null {
     try {
         const raw = JSON.parse(readFileSync(FILE, 'utf8')) as Snapshot;
-        const revive = (h: Hunter): Hunter => ({
-            ...h,
-            lastKillAt: new Date(h.lastKillAt),
-            recentMobs: h.recentMobs.map(m => ({ name: m.name, at: new Date(m.at) })),
-        });
+        const cutoff = Date.now() - MAX_WINDOW_MINUTES * 60_000;
+        const revive = ({ serial, name, race, className, level, lastKillAt, lastMob }: Hunter): Hunter | null => {
+            const at = new Date(lastKillAt);
+            if (!(at.getTime() >= cutoff)) return null;
+            return { serial, name, race, className, level, lastKillAt: at, lastMob };
+        };
         return {
             ...raw,
             updatedAt: new Date(raw.updatedAt),
