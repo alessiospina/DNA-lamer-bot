@@ -6,7 +6,7 @@ let sessionCookie: string | undefined;
 let resumeAt = 0;
 
 /** The site answers 429 above roughly one request per second: pace the calls and back off on 429. */
-const PACE_MS = 900;
+const PACE_MS = 1_500;
 const MAX_ATTEMPTS = 6;
 const PROFILE_ATTEMPTS = 2;
 const PROFILE_TIMEOUT_MS = 5_000;
@@ -15,7 +15,7 @@ const DEFAULT_RATE_LIMIT_PAUSE_MS = 30_000;
 /** A profile whose PX did not move is reopened anyway after this long, at most STALE_PER_CYCLE per refresh (safety net for kills that give no PX). */
 const STALE_MS = 20 * 60_000;
 const STALE_PER_CYCLE = 4;
-export const MAX_WINDOW_MINUTES = 24 * 60;
+export const MAX_WINDOW_MINUTES = 15;
 
 interface RankingEntry {
     rank: number;
@@ -67,6 +67,14 @@ export interface Snapshot {
     fetched: number;
 }
 
+interface RefreshResult {
+    snapshot: Snapshot;
+    read: number;
+    unavailable: number;
+    failed: number;
+    deferred: number;
+}
+
 type Fetched<T> = { ok: true; data: T } | { ok: false; reason: 'gone' | 'session' | 'transient' | 'exhausted' | 'rateLimited' };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -89,7 +97,8 @@ function applyRateLimit(res: Response, path: string): boolean {
     const pause = Number.isFinite(delay) ? Math.max(PACE_MS, delay) : DEFAULT_RATE_LIMIT_PAUSE_MS;
     resumeAt = Math.max(resumeAt, now + pause);
     void res.body?.cancel().catch(() => {});
-    console.warn(`DNA Shard ha risposto 429 su ${path}, richieste sospese per almeno ${Math.ceil((resumeAt - now) / 1000)}s`);
+    const header = retryAfter === null ? 'assente' : JSON.stringify(retryAfter);
+    console.warn(`DNA Shard ha risposto 429 su ${path} (Retry-After: ${header}), richieste sospese per almeno ${Math.ceil((resumeAt - now) / 1000)}s`);
     return true;
 }
 
@@ -194,7 +203,7 @@ export function getHunters(snapshot: Snapshot): Hunter[] {
  * One request reads the "Progressione" ranking, which carries every player's PX. Only the profiles of players whose PX changed (plus a few of
  * the oldest ones) are reopened; the first run, without a previous snapshot, opens all of them.
  */
-export async function refresh(prev: Snapshot | null, onProgress?: (done: number, total: number) => void): Promise<Snapshot> {
+export async function refresh(prev: Snapshot | null, onProgress?: (done: number, total: number) => void): Promise<RefreshResult> {
     const updatedAt = new Date();
     const rankings = await getJson<{ boards: { id: string; entries: RankingEntry[] }[] }>('/rankings');
     const board = rankings.ok ? rankings.data.boards.find(b => b.id === 'livello') : undefined;
@@ -229,6 +238,9 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
     const toFetch = [...changed, ...stale.slice(0, STALE_PER_CYCLE)];
 
     let done = 0;
+    let read = 0;
+    let unavailable = 0;
+    let failed = 0;
     let renewedSession = false;
     const readProfile = (serial: number, cookie: string) => getJson<ProfileResponse>(
         `/profile/${serial}`, { attempts: PROFILE_ATTEMPTS, timeoutMs: PROFILE_TIMEOUT_MS, cookie },
@@ -253,6 +265,8 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
         const attemptedAt = Date.now();
         if (res.ok || res.reason === 'gone') {
             const hunter = res.ok ? buildHunter(e.serial, res.data) : null;
+            if (res.ok) read++;
+            else unavailable++;
             known.set(e.serial, { serial: e.serial, xp: e.xp, fetchedAt: attemptedAt, hunter });
         } else {
             // Keep the PX baseline and last valid data so a failed read can be retried.
@@ -262,11 +276,12 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
             } else if (res.reason === 'rateLimited') {
                 console.warn(`Profilo rimandato per limite richieste: ${JSON.stringify(e.name)} (seriale ${e.serial})`);
             }
+            if (res.reason !== 'rateLimited') failed++;
         }
         done++;
         onProgress?.(done, toFetch.length);
         if (!res.ok && res.reason === 'rateLimited') break;
-        await sleep(PACE_MS);
+        if (done < toFetch.length) await sleep(PACE_MS);
     }
 
     // Name, race, class and level always come from the ranking, so they are current even when the profile was not reopened.
@@ -278,7 +293,13 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
         const level = Number.isFinite(e.level) ? e.level : t.hunter.level;
         return { ...t, hunter: { ...t.hunter, name: e.name, race: e.race, className: e.className, level } };
     });
-    return { updatedAt, tracked, fetched: done };
+    return {
+        snapshot: { updatedAt, tracked, fetched: done },
+        read,
+        unavailable,
+        failed,
+        deferred: toFetch.length - read - unavailable - failed,
+    };
 }
 
 export interface ServerStatus {

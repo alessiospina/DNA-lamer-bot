@@ -28,7 +28,6 @@ if (!token) {
     process.exit(1);
 }
 
-const DEFAULT_WINDOW_MIN = 60;
 const PEAK_START_HOUR = 10;
 const PEAK_END_HOUR = 1;
 const SNOOZE_START_HOUR = 3;
@@ -46,7 +45,7 @@ const command = new SlashCommandBuilder()
     .setName('trovasgub')
     .setDescription("Mostra i player che stanno cacciando adesso, con l'ultimo mob ucciso")
     .addIntegerOption(o =>
-        o.setName('minuti').setDescription(`Finestra di attività in minuti (default ${DEFAULT_WINDOW_MIN})`).setMinValue(1).setMaxValue(MAX_WINDOW_MINUTES),
+        o.setName('minuti').setDescription(`Finestra di attività in minuti (default ${MAX_WINDOW_MINUTES})`).setMinValue(1).setMaxValue(MAX_WINDOW_MINUTES),
     );
 
 const playerCommand = new SlashCommandBuilder().setName('player').setDescription('Quanti player ci sono online adesso, con un invito alla violenza');
@@ -63,10 +62,9 @@ const INFO_FIELDS = [
     {
         name: 'Quando aggiorno i dati · ora italiana',
         value: [
-            `${PEAK_START_HOUR}:00–0${PEAK_END_HOUR}:00 · ogni ${PEAK_REFRESH_MINUTES} minuti.`,
-            `0${PEAK_END_HOUR}:00–0${SNOOZE_START_HOUR}:00 · ogni ${OFF_PEAK_REFRESH_MINUTES} minuti.`,
+            `${PEAK_START_HOUR}:00–0${PEAK_END_HOUR}:00 · ogni ${PEAK_REFRESH_MINUTES} minuti. Mi addormento dopo ${IDLE_MINUTES} minuti senza \`/trovasgub\`.`,
+            `0${PEAK_END_HOUR}:00–0${SNOOZE_START_HOUR}:00 · ogni ${OFF_PEAK_REFRESH_MINUTES} minuti. Mi addormento dopo ${IDLE_MINUTES} minuti senza \`/trovasgub\`.`,
             `0${SNOOZE_START_HOUR}:00–${PEAK_START_HOUR}:00 · parto in pausa. Se mi svegli, aggiorno ogni ${OFF_PEAK_REFRESH_MINUTES} minuti e torno a dormire dopo ${MORNING_IDLE_MINUTES} minuti senza \`/trovasgub\`.`,
-            `Nelle altre fasce mi addormento dopo ${IDLE_MINUTES} minuti senza \`/trovasgub\`.`,
             'Se sto dormendo, solo `/trovasgub` mi sveglia. Ti chiedo di riprovare tra qualche minuto, appena ho aggiornato i dati.',
         ].join('\n'),
     },
@@ -74,7 +72,7 @@ const INFO_FIELDS = [
         name: '/trovasgub  ·  [minuti]',
         value: [
             'La lista dei farmatori attivi, dal più fresco al più sudato, con l\'ultimo mob ucciso e quanto tempo fa.',
-            `Di default guardo l'ultima ora. Con \`minuti:15\` restringo il campo a chi è ancora caldo: prede perfette. Massimo 1440, perché un giorno intero di farm è già un sintomo.`,
+            `Guardo gli ultimi ${MAX_WINDOW_MINUTES} minuti. Con \`minuti:5\` restringo il campo a chi è ancora caldo.`,
         ].join('\n'),
     },
     {
@@ -151,15 +149,17 @@ function wakeForTrovasgub(): boolean {
 
 async function runRefresh(): Promise<void> {
     refreshing = true;
+    const startedAt = performance.now();
     try {
         const result = await refresh(snapshot, (done, total) => {
             progress = { done, total };
         });
-        snapshot = result;
-        saveSnapshot(result);
+        snapshot = result.snapshot;
+        saveSnapshot(snapshot);
         if (Date.now() >= getDnaCooldownUntil()) wakeRefreshPending = false;
-        const recentKills = result.tracked.filter(t => t.hunter).length;
-        console.log(`Aggiornamento: ${result.fetched} profili riaperti, ${result.tracked.length} seguiti, ${recentKills} con kill nelle ultime 24 ore`);
+        const recentKills = snapshot.tracked.filter(t => t.hunter).length;
+        const seconds = ((performance.now() - startedAt) / 1_000).toFixed(1);
+        console.log(`Aggiornamento in ${seconds}s: ${result.read} profili letti, ${result.unavailable} privati o assenti, ${result.failed} falliti, ${result.deferred} rimandati. ${snapshot.tracked.length} seguiti, ${recentKills} con kill negli ultimi ${MAX_WINDOW_MINUTES} minuti.`);
     } catch (err) {
         console.error('Aggiornamento fallito, resta lo snapshot precedente', err);
     } finally {
@@ -191,7 +191,7 @@ function pages(lines: string[]): string[] {
 async function handleTrovasgub(interaction: ChatInputCommandInteraction): Promise<void> {
     const waking = wakeForTrovasgub();
     if (waking || !snapshot) {
-        const where = progress ? ` (${progress.done}/${progress.total} profili letti)` : '';
+        const where = progress ? ` (${progress.done}/${progress.total} profili elaborati)` : '';
         const loading = waking ? 'Stavo ronfando! Mi rimetto a caccia' : 'I primi dati sono ancora in preparazione';
         await interaction.reply({
             content: `${loading}${where}. Riprova tra qualche minuto.`,
@@ -199,7 +199,7 @@ async function handleTrovasgub(interaction: ChatInputCommandInteraction): Promis
         });
         return;
     }
-    const minutes = interaction.options.getInteger('minuti') ?? DEFAULT_WINDOW_MIN;
+    const minutes = Math.min(interaction.options.getInteger('minuti') ?? MAX_WINDOW_MINUTES, MAX_WINDOW_MINUTES);
     const result = snapshot;
     const threshold = Date.now() - minutes * 60_000;
     const active = getHunters(result).filter(h => h.lastKillAt.getTime() >= threshold);
