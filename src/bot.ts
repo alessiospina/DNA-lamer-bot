@@ -1,6 +1,6 @@
 import { ChatInputCommandInteraction, Client, EmbedBuilder, GatewayIntentBits, MessageFlags, SlashCommandBuilder } from 'discord.js';
 import { randomPhrase } from './phrases.js';
-import { type Hunter, type Snapshot, MAX_WINDOW_MINUTES, fetchStatus, getDnaCooldownUntil, getHunters, refresh } from './scraper.js';
+import { type Hunter, type Snapshot, DEFAULT_WINDOW_MINUTES, MAX_WINDOW_MINUTES, fetchStatus, getDnaCooldownUntil, getHunters, refresh } from './scraper.js';
 import { loadSnapshot, saveSnapshot } from './store.js';
 
 try {
@@ -45,7 +45,7 @@ const command = new SlashCommandBuilder()
     .setName('trovasgub')
     .setDescription("Mostra i player che stanno cacciando adesso, con l'ultimo mob ucciso")
     .addIntegerOption(o =>
-        o.setName('minuti').setDescription(`Finestra di attività in minuti (default ${MAX_WINDOW_MINUTES})`).setMinValue(1).setMaxValue(MAX_WINDOW_MINUTES),
+        o.setName('minuti').setDescription(`Finestra di attività in minuti (default ${DEFAULT_WINDOW_MINUTES})`).setMinValue(1).setMaxValue(MAX_WINDOW_MINUTES),
     );
 
 const playerCommand = new SlashCommandBuilder().setName('player').setDescription('Quanti player ci sono online adesso, con un invito alla violenza');
@@ -72,7 +72,7 @@ const INFO_FIELDS = [
         name: '/trovasgub  ·  [minuti]',
         value: [
             'La lista dei farmatori attivi, dal più fresco al più sudato, con l\'ultimo mob ucciso e quanto tempo fa.',
-            `Guardo gli ultimi ${MAX_WINDOW_MINUTES} minuti. Con \`minuti:5\` restringo il campo a chi è ancora caldo.`,
+            `Di default guardo gli ultimi ${DEFAULT_WINDOW_MINUTES} minuti. Puoi scegliere una finestra da 1 a ${MAX_WINDOW_MINUTES} minuti, per esempio \`/trovasgub minuti:${MAX_WINDOW_MINUTES}\`.`,
         ].join('\n'),
     },
     {
@@ -157,11 +157,12 @@ async function runRefresh(): Promise<void> {
         snapshot = result.snapshot;
         saveSnapshot(snapshot);
         if (Date.now() >= getDnaCooldownUntil()) wakeRefreshPending = false;
-        const recentKills = snapshot.tracked.filter(t => t.hunter).length;
+        const recentCutoff = Date.now() - DEFAULT_WINDOW_MINUTES * MINUTE_MS;
+        const recentKills = snapshot.tracked.filter(t => t.hunter && t.hunter.lastKillAt.getTime() >= recentCutoff).length;
         const seconds = ((performance.now() - startedAt) / 1_000).toFixed(1);
-        console.log(`Aggiornamento in ${seconds}s: ${result.read} profili letti, ${result.unavailable} privati o assenti, ${result.failed} falliti, ${result.deferred} rimandati. ${snapshot.tracked.length} seguiti, ${recentKills} con kill negli ultimi ${MAX_WINDOW_MINUTES} minuti.`);
+        console.log(`Aggiornamento in ${seconds}s: ${result.read} profili letti, ${result.unavailable} privati o assenti, ${result.failed} falliti, ${result.deferred} rimandati. ${snapshot.tracked.length} seguiti, ${recentKills} con kill negli ultimi ${DEFAULT_WINDOW_MINUTES} minuti.`);
         const latestKill = result.latestKillAt?.toLocaleString('it-IT', { timeZone: TIME_ZONE }) ?? 'nessuna';
-        console.log(`Kill nei profili letti: ${result.recentKills} entro ${MAX_WINDOW_MINUTES} min, ${result.olderKills} più vecchie, ${result.noKill} senza kill rilevate. Più recente (ora italiana): ${latestKill}.`);
+        console.log(`Kill nei profili letti: ${result.recentKills} entro ${DEFAULT_WINDOW_MINUTES} min, ${result.olderKills} più vecchie, ${result.noKill} senza kill rilevate. Più recente (ora italiana): ${latestKill}.`);
     } catch (err) {
         console.error('Aggiornamento fallito, resta lo snapshot precedente', err);
     } finally {
@@ -201,7 +202,7 @@ async function handleTrovasgub(interaction: ChatInputCommandInteraction): Promis
         });
         return;
     }
-    const minutes = Math.min(interaction.options.getInteger('minuti') ?? MAX_WINDOW_MINUTES, MAX_WINDOW_MINUTES);
+    const minutes = Math.min(interaction.options.getInteger('minuti') ?? DEFAULT_WINDOW_MINUTES, MAX_WINDOW_MINUTES);
     const result = snapshot;
     const threshold = Date.now() - minutes * 60_000;
     const active = getHunters(result).filter(h => h.lastKillAt.getTime() >= threshold);

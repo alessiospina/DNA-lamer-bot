@@ -15,7 +15,8 @@ const DEFAULT_RATE_LIMIT_PAUSE_MS = 30_000;
 /** A profile whose PX did not move is reopened anyway after this long, at most STALE_PER_CYCLE per refresh (safety net for kills that give no PX). */
 const STALE_MS = 20 * 60_000;
 const STALE_PER_CYCLE = 4;
-export const MAX_WINDOW_MINUTES = 15;
+export const DEFAULT_WINDOW_MINUTES = 15;
+export const MAX_WINDOW_MINUTES = 60;
 
 interface RankingEntry {
     rank: number;
@@ -294,8 +295,10 @@ export async function refresh(prev: Snapshot | null, onProgress?: (done: number,
     }
 
     // Name, race, class and level always come from the ranking, so they are current even when the profile was not reopened.
-    const cutoff = Date.now() - MAX_WINDOW_MINUTES * 60_000;
-    const recentKills = readKillTimes.filter(at => at >= cutoff).length;
+    const finishedAt = Date.now();
+    const cutoff = finishedAt - MAX_WINDOW_MINUTES * 60_000;
+    const recentCutoff = finishedAt - DEFAULT_WINDOW_MINUTES * 60_000;
+    const recentKills = readKillTimes.filter(at => at >= recentCutoff).length;
     const latestKillTime = readKillTimes.reduce((latest, at) => Math.max(latest, at), -Infinity);
     const tracked = entries.map(e => {
         const t = known.get(e.serial)!;
